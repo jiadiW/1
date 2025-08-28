@@ -1,0 +1,172 @@
+# -*- coding: utf-8 -*-
+import re
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+
+# ---------- Helpers ----------
+
+def choose_col(df, candidates, required=True):
+    """Pick the first existing column from candidates (case-insensitive)."""
+    cols_lower = {c.lower(): c for c in df.columns}
+    for cand in candidates:
+        if cand in df.columns:
+            return cand
+        if cand.lower() in cols_lower:
+            return cols_lower[cand.lower()]
+    if required:
+        raise KeyError(f"None of the columns {candidates} found in: {list(df.columns)}")
+    return None
+
+# domain-specific normalization to help map variants like "CPI QoQ → CPI, Q/Q%" or "GDP YTD, Y/Y% -> GDP YoY"
+_norm_patterns = [
+    # time comparisons
+    (r'\bquarter[-\s]?over[-\s]?quarter\b', 'qoq'),
+    (r'\bq\s*/\s*q\b', 'qoq'),
+    (r'\bqo?q\b', 'qoq'),
+    (r'\byear[-\s]?over[-\s]?year\b', 'yoy'),
+    (r'\by\s*/\s*y\b', 'yoy'),
+    (r'\byo?y\b', 'yoy'),
+    (r'\bmonth[-\s]?over[-\s]?month\b', 'mom'),
+    (r'\bm\s*/\s*m\b', 'mom'),
+    (r'\bmo?m\b', 'mom'),
+    (r'\byear[-\s]?to[-\s]?date\b', 'ytd'),
+    (r'\by[\s\-]?t[\s\-]?d\b', 'ytd'),
+    # economic indicators
+    (r'\bconsumer price index\b', 'cpi'),
+    (r'\bproducer price index\b', 'ppi'),
+    (r'\bgross domestic product\b', 'gdp'),
+    (r"\bpurchasing managers'? index\b", 'pmi'),
+    (r'\bnon[\-\s]?farm payrolls?\b', 'nfp'),
+    (r'\bunemployment rate\b', 'unemployment'),
+    (r'\bindustrial production\b', 'industrial production'),
+    (r'\btrade balance\b', 'trade balance'),
+    (r'\bcurrent account\b', 'current account'),
+    (r'\bretail sales?\b', 'retail sales'),
+    (r'\bbuilding permits\b', 'building permits'),
+    (r'\bhousing starts\b', 'housing starts'),
+    (r'\bnew home sales\b', 'new home sales'),
+    (r'\bexisting home sales\b', 'existing home sales'),
+    (r'\baverage hourly earnings\b', 'average hourly earnings'),
+    (r'\bism manufacturing\b', 'ism manufacturing'),
+    (r'\bism services\b', 'ism services'),
+    (r'\bservices pmi\b', 'services pmi'),
+    (r'\bmanufacturing pmi\b', 'manufacturing pmi'),
+    # units / symbols
+    (r'%', ' percent '),
+]
+
+def normalize_text(text: str) -> str:
+    if pd.isna(text):
+        return ""
+    s = str(text)
+    s = s.lower()
+    # standardize unicode and punctuation
+    s = s.replace('’', "'").replace('–', '-').replace('—', '-').replace('“', '"').replace('”', '"')
+    # apply patterns
+    for pat, repl in _norm_patterns:
+        s = re.sub(pat, repl, s)
+    # unify separators
+    s = re.sub(r'[^a-z0-9\s]+', ' ', s)  # keep alnum/space
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+def build_combined_text(row, name_col, details_col):
+    name = normalize_text(row.get(name_col, ""))
+    det = normalize_text(row.get(details_col, ""))
+    # gentle emphasis on name without leaving TF-IDF framework
+    return (name + " ") + det
+
+def ensure_str(x):
+    return "" if pd.isna(x) else str(x)
+
+# ---------- Load data ----------
+path1 = Path("/mnt/data/news_event_pairs.xlsx")
+path2 = Path("/mnt/data/news_pairs_to_map.xlsx")
+
+df1 = pd.read_excel(path1)
+df2 = pd.read_excel(path2)
+
+# Identify columns
+sym1 = choose_col(df1, ["sym", "currency"])
+event1 = choose_col(df1, ["eventName", "event_name", "event"])
+desc1 = choose_col(df1, ["description", "details_description", "detailed_description", "detailed description"])
+
+sym2 = choose_col(df2, ["sym", "currency"])
+event2 = choose_col(df2, ["eventName", "event_name", "event"])
+name2 = choose_col(df2, ["name", "event_title", "title"])
+details2 = choose_col(df2, ["details_description", "detailed_description", "detailed description", "description"])
+
+# Normalize and prepare texts
+df1["_currency_norm"] = df1[sym1].astype(str).str.upper().str.strip()
+df2["_currency_norm"] = df2[sym2].astype(str).str.upper().str.strip()
+
+df1["_desc_norm"] = df1[desc1].map(normalize_text)
+df2["_text_norm"] = df2.apply(lambda r: build_combined_text(r, name2, details2), axis=1)
+
+# Preallocate results
+best_event_out, best_curr_out, best_desc_out, best_score_out, label_out = [], [], [], [], []
+
+# Similarity threshold (top-1 cosine sim)
+SIM_THRESHOLD = 0.35
+
+# Process per-currency block
+for curr, g2 in df2.groupby("_currency_norm", sort=False):
+    g1 = df1[df1["_currency_norm"] == curr]
+    idx2 = g2.index.to_list()
+    if g1.empty:
+        best_event_out.extend([""] * len(idx2))
+        best_curr_out.extend([curr] * len(idx2))
+        best_desc_out.extend([""] * len(idx2))
+        best_score_out.extend([0.0] * len(idx2))
+        label_out.extend([0] * len(idx2))
+        continue
+
+    # Fit TF-IDF on union vocabulary (unigrams + bigrams)
+    corpus_1 = g1["_desc_norm"].fillna("").tolist()
+    corpus_2 = g2["_text_norm"].fillna("").tolist()
+    union_corpus = corpus_1 + corpus_2
+
+    vectorizer = TfidfVectorizer(
+        ngram_range=(1, 2),
+        min_df=1,
+        norm='l2',
+        sublinear_tf=True,
+        token_pattern=r'(?u)\b\w+\b'
+    )
+    X_union = vectorizer.fit_transform(union_corpus)
+    X1 = X_union[:len(corpus_1), :]
+    X2 = X_union[len(corpus_1):, :]
+
+    # Cosine similarity for each pair (dataset2 row vs all dataset1 rows in same currency)
+    sim = cosine_similarity(X2, X1)  # [len(g2), len(g1)]
+    max_idx = sim.argmax(axis=1)
+    max_val = sim.max(axis=1)
+
+    for i, (j, s) in enumerate(zip(max_idx, max_val)):
+        row1 = g1.iloc[j]
+        best_event_out.append(ensure_str(row1[event1]))
+        best_curr_out.append(curr)
+        best_desc_out.append(ensure_str(row1[desc1]))
+        best_score_out.append(float(s))
+        label_out.append(int(s >= SIM_THRESHOLD))
+
+# Attach results back to df2 preserving row order
+df2_out = df2.copy()
+df2_out["best_match_eventName"] = best_event_out
+df2_out["best_match_currency"] = best_curr_out
+df2_out["best_match_description"] = best_desc_out
+df2_out["similarity"] = np.round(best_score_out, 6)
+df2_out["label"] = label_out
+
+# Drop helper columns that start with underscore
+drop_helpers = [c for c in df2_out.columns if str(c).startswith("_")]
+df2_out = df2_out.drop(columns=drop_helpers)
+
+# Save to Excel (schema aligned to "example_results")
+out_path = Path("/mnt/data/example_results.xlsx")
+df2_out.to_excel(out_path, index=False)
+print("Wrote:", out_path)
